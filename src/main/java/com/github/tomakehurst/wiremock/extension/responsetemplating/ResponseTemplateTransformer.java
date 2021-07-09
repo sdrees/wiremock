@@ -15,6 +15,7 @@
  */
 package com.github.tomakehurst.wiremock.extension.responsetemplating;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.github.jknack.handlebars.Handlebars;
 import com.github.jknack.handlebars.Helper;
 import com.github.jknack.handlebars.helper.AssignHelper;
@@ -24,10 +25,14 @@ import com.github.jknack.handlebars.helper.StringHelpers;
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.common.Exceptions;
 import com.github.tomakehurst.wiremock.common.FileSource;
+import com.github.tomakehurst.wiremock.common.Json;
 import com.github.tomakehurst.wiremock.common.TextFile;
 import com.github.tomakehurst.wiremock.extension.Parameters;
 import com.github.tomakehurst.wiremock.extension.ResponseDefinitionTransformer;
 import com.github.tomakehurst.wiremock.extension.StubLifecycleListener;
+import com.github.tomakehurst.wiremock.extension.responsetemplating.helpers.HandlebarsHelper;
+import com.github.tomakehurst.wiremock.extension.responsetemplating.helpers.ParameterNormalisingHelperWrapper;
+import com.github.tomakehurst.wiremock.extension.responsetemplating.helpers.SystemValueHelper;
 import com.github.tomakehurst.wiremock.extension.responsetemplating.helpers.WireMockHelpers;
 import com.github.tomakehurst.wiremock.http.HttpHeader;
 import com.github.tomakehurst.wiremock.http.HttpHeaders;
@@ -39,14 +44,14 @@ import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
-import com.google.common.collect.Lists;
 
 import java.io.IOException;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 
@@ -76,10 +81,10 @@ public class ResponseTemplateTransformer extends ResponseDefinitionTransformer i
     }
 
     public ResponseTemplateTransformer(boolean global, Map<String, Helper> helpers) {
-        this(global, new Handlebars(), helpers, null);
+        this(global, new Handlebars(), helpers, null, null);
     }
 
-    public ResponseTemplateTransformer(boolean global, Handlebars handlebars, Map<String, Helper> helpers, Long maxCacheEntries) {
+    public ResponseTemplateTransformer(boolean global, Handlebars handlebars, Map<String, Helper> helpers, Long maxCacheEntries, Set<String> permittedSystemKeys) {
         this.global = global;
         this.handlebars = handlebars;
 
@@ -92,21 +97,25 @@ public class ResponseTemplateTransformer extends ResponseDefinitionTransformer i
         for (NumberHelper helper: NumberHelper.values()) {
             this.handlebars.registerHelper(helper.name(), helper);
         }
-        
+
         for (ConditionalHelpers helper: ConditionalHelpers.values()) {
-        	this.handlebars.registerHelper(helper.name(), helper);
+            this.handlebars.registerHelper(helper.name(), helper);
         }
 
         this.handlebars.registerHelper(AssignHelper.NAME, new AssignHelper());
 
         //Add all available wiremock helpers
-        for(WireMockHelpers helper: WireMockHelpers.values()){
+        for (WireMockHelpers helper: WireMockHelpers.values()) {
             this.handlebars.registerHelper(helper.name(), helper);
         }
+
+        this.handlebars.registerHelper("systemValue", new SystemValueHelper(new SystemKeyAuthoriser(permittedSystemKeys)));
 
         for (Map.Entry<String, Helper> entry: helpers.entrySet()) {
             this.handlebars.registerHelper(entry.getKey(), entry.getValue());
         }
+
+        decorateHelpersWithParameterUnwrapper();
 
         this.maxCacheEntries = maxCacheEntries;
         CacheBuilder<Object, Object> cacheBuilder = CacheBuilder.newBuilder();
@@ -114,6 +123,13 @@ public class ResponseTemplateTransformer extends ResponseDefinitionTransformer i
             cacheBuilder.maximumSize(maxCacheEntries);
         }
         cache = cacheBuilder.build();
+    }
+
+    private void decorateHelpersWithParameterUnwrapper() {
+        handlebars.helpers().forEach(entry -> {
+            Helper<?> newHelper = new ParameterNormalisingHelperWrapper((Helper<Object>) entry.getValue());
+            handlebars.registerHelper(entry.getKey(), newHelper);
+        });
     }
 
     @Override
@@ -137,18 +153,21 @@ public class ResponseTemplateTransformer extends ResponseDefinitionTransformer i
                 .build();
 
         if (responseDefinition.specifiesTextBodyContent()) {
-            HandlebarsOptimizedTemplate bodyTemplate = getTemplate(TemplateCacheKey.forInlineBody(responseDefinition), responseDefinition.getBody());
-            applyTemplatedResponseBody(newResponseDefBuilder, model, bodyTemplate);
+            boolean isJsonBody = responseDefinition.getJsonBody() != null;
+            HandlebarsOptimizedTemplate bodyTemplate = getTemplate(TemplateCacheKey.forInlineBody(responseDefinition), responseDefinition.getTextBody());
+            applyTemplatedResponseBody(newResponseDefBuilder, model, bodyTemplate, isJsonBody);
         } else if (responseDefinition.specifiesBodyFile()) {
             HandlebarsOptimizedTemplate filePathTemplate = new HandlebarsOptimizedTemplate(handlebars, responseDefinition.getBodyFileName());
             String compiledFilePath = uncheckedApplyTemplate(filePathTemplate, model);
-            TextFile file = files.getTextFileNamed(compiledFilePath);
 
             boolean disableBodyFileTemplating = parameters.getBoolean("disableBodyFileTemplating", false);
-            if (!disableBodyFileTemplating) {
+            if (disableBodyFileTemplating) {
+                newResponseDefBuilder.withBodyFile(compiledFilePath);
+            } else {
+                TextFile file = files.getTextFileNamed(compiledFilePath);
                 HandlebarsOptimizedTemplate bodyTemplate = getTemplate(
                         TemplateCacheKey.forFileBody(responseDefinition, compiledFilePath), file.readContentsAsString());
-                applyTemplatedResponseBody(newResponseDefBuilder, model, bodyTemplate);
+                applyTemplatedResponseBody(newResponseDefBuilder, model, bodyTemplate, false);
             }
         }
 
@@ -172,10 +191,31 @@ public class ResponseTemplateTransformer extends ResponseDefinitionTransformer i
         if (responseDefinition.getProxyBaseUrl() != null) {
             HandlebarsOptimizedTemplate proxyBaseUrlTemplate = getTemplate(TemplateCacheKey.forProxyUrl(responseDefinition), responseDefinition.getProxyBaseUrl());
             String newProxyBaseUrl = uncheckedApplyTemplate(proxyBaseUrlTemplate, model);
-            newResponseDefBuilder.proxiedFrom(newProxyBaseUrl);
-        }
 
-        return newResponseDefBuilder.build();
+            ResponseDefinitionBuilder.ProxyResponseDefinitionBuilder newProxyResponseDefBuilder = newResponseDefBuilder.proxiedFrom(newProxyBaseUrl);
+
+            if (responseDefinition.getAdditionalProxyRequestHeaders() != null) {
+                Iterable<HttpHeader> newResponseHeaders = Iterables.transform(responseDefinition.getAdditionalProxyRequestHeaders().all(), new Function<HttpHeader, HttpHeader>() {
+                    @Override
+                    public HttpHeader apply(final HttpHeader header) {
+                        ImmutableList.Builder<String> valueListBuilder = ImmutableList.builder();
+                        int index = 0;
+                        for (String headerValue: header.values()) {
+                            HandlebarsOptimizedTemplate template = getTemplate(TemplateCacheKey.forHeader(responseDefinition, header.key(), index++), headerValue);
+                            valueListBuilder.add(uncheckedApplyTemplate(template, model));
+                        }
+                        return new HttpHeader(header.key(), valueListBuilder.build());
+                    }
+                });
+                HttpHeaders proxyHttpHeaders = new HttpHeaders(newResponseHeaders);
+                for (String key: proxyHttpHeaders.keys()) {
+                    newProxyResponseDefBuilder.withAdditionalRequestHeader(key, proxyHttpHeaders.getHeader(key).firstValue());
+                }
+            }
+            return newProxyResponseDefBuilder.build();
+        } else {
+            return newResponseDefBuilder.build();
+        }
     }
 
     /**
@@ -185,9 +225,14 @@ public class ResponseTemplateTransformer extends ResponseDefinitionTransformer i
         return Collections.emptyMap();
     }
 
-    private void applyTemplatedResponseBody(ResponseDefinitionBuilder newResponseDefBuilder, ImmutableMap<String, Object> model, HandlebarsOptimizedTemplate bodyTemplate) {
+    private void applyTemplatedResponseBody(ResponseDefinitionBuilder newResponseDefBuilder, ImmutableMap<String, Object> model, HandlebarsOptimizedTemplate bodyTemplate, boolean isJsonBody) {
         String newBody = uncheckedApplyTemplate(bodyTemplate, model);
-        newResponseDefBuilder.withBody(newBody);
+        if (isJsonBody) {
+            newResponseDefBuilder.withJsonBody(Json.read(newBody, JsonNode.class));
+        } else {
+            newResponseDefBuilder.withBody(newBody);
+        }
+
     }
 
     private String uncheckedApplyTemplate(HandlebarsOptimizedTemplate template, Object context) {
@@ -216,18 +261,30 @@ public class ResponseTemplateTransformer extends ResponseDefinitionTransformer i
     }
 
     @Override
-    public void stubCreated(StubMapping stub) {}
+    public void beforeStubCreated(StubMapping stub) {}
 
     @Override
-    public void stubEdited(StubMapping oldStub, StubMapping newStub) {}
+    public void afterStubCreated(StubMapping stub) {}
 
     @Override
-    public void stubRemoved(StubMapping stub) {
+    public void beforeStubEdited(StubMapping oldStub, StubMapping newStub) {}
+
+    @Override
+    public void afterStubEdited(StubMapping oldStub, StubMapping newStub) {}
+
+    @Override
+    public void beforeStubRemoved(StubMapping stub) {}
+
+    @Override
+    public void afterStubRemoved(StubMapping stub) {
         cache.invalidateAll();
     }
 
     @Override
-    public void stubsReset() {
+    public void beforeStubsReset() {}
+
+    @Override
+    public void afterStubsReset() {
         cache.invalidateAll();
     }
 
@@ -244,6 +301,7 @@ public class ResponseTemplateTransformer extends ResponseDefinitionTransformer i
         private Handlebars handlebars = new Handlebars();
         private Map<String, Helper> helpers = new HashMap<>();
         private Long maxCacheEntries = null;
+        private Set<String> permittedSystemKeys = null;
 
         public Builder global(boolean global) {
             this.global = global;
@@ -270,8 +328,18 @@ public class ResponseTemplateTransformer extends ResponseDefinitionTransformer i
             return this;
         }
 
+        public Builder permittedSystemKeys(Set<String> keys) {
+            this.permittedSystemKeys = keys;
+            return this;
+        }
+
+        public Builder permittedSystemKeys(String... keys) {
+            this.permittedSystemKeys = ImmutableSet.copyOf(keys);
+            return this;
+        }
+
         public ResponseTemplateTransformer build() {
-            return new ResponseTemplateTransformer(global, handlebars, helpers, maxCacheEntries);
+            return new ResponseTemplateTransformer(global, handlebars, helpers, maxCacheEntries, permittedSystemKeys);
         }
     }
 }

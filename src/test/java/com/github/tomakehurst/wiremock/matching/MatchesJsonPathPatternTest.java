@@ -15,23 +15,26 @@
  */
 package com.github.tomakehurst.wiremock.matching;
 
-import com.fasterxml.jackson.databind.JsonMappingException;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.common.Json;
 import com.github.tomakehurst.wiremock.common.JsonException;
 import com.github.tomakehurst.wiremock.common.LocalNotifier;
 import com.github.tomakehurst.wiremock.common.Notifier;
+import org.hamcrest.Matchers;
 import org.jmock.Expectations;
 import org.jmock.Mockery;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static com.github.tomakehurst.wiremock.testsupport.WireMatchers.equalToJson;
-import static org.hamcrest.Matchers.instanceOf;
-import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.*;
+import static net.javacrumbs.jsonunit.JsonMatchers.jsonEquals;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.*;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class MatchesJsonPathPatternTest {
 
@@ -289,9 +292,67 @@ public class MatchesJsonPathPatternTest {
         assertThat(stringValuePattern, instanceOf(MatchesJsonPathPattern.class));
         assertThat(stringValuePattern.getExpected(), is("$..thing"));
 
-        StringValuePattern subMatcher = ((MatchesJsonPathPattern) stringValuePattern).getValuePattern();
+        ContentPattern<?> subMatcher = ((MatchesJsonPathPattern) stringValuePattern).getValuePattern();
         assertThat(subMatcher, instanceOf(EqualToPattern.class));
         assertThat(subMatcher.getExpected(), is("the value"));
+    }
+
+    @Test
+    public void correctlyDeserialisesWithAbsentValuePattern() {
+        StringValuePattern stringValuePattern = Json.read(
+                "{                                      \n" +
+                "    \"matchesJsonPath\": {              \n" +
+                "        \"expression\": \"$..thing\",   \n" +
+                "        \"absent\": \"(absent)\"        \n" +
+                "    }                                   \n" +
+                "}",
+                StringValuePattern.class);
+
+        assertThat(stringValuePattern, instanceOf(MatchesJsonPathPattern.class));
+        assertThat(stringValuePattern.getExpected(), is("$..thing"));
+
+        ContentPattern<?> subMatcher = ((MatchesJsonPathPattern) stringValuePattern).getValuePattern();
+        assertThat(subMatcher, instanceOf(AbsentPattern.class));
+        assertThat(((StringValuePattern) subMatcher).nullSafeIsAbsent(), is(true));
+    }
+
+    @Test
+    public void correctlyDeserialisesWhenSubMatcherHasExtraParameters() {
+        StringValuePattern stringValuePattern = Json.read(
+                "{                                       \n" +
+                "    \"matchesJsonPath\": {              \n" +
+                "        \"expression\": \"$..thing\",   \n" +
+                "        \"equalToJson\": \"{}\",        \n" +
+                "        \"ignoreExtraElements\": true,  \n" +
+                "        \"ignoreArrayOrder\": true   \n" +
+                "    }                                   \n" +
+                "}",
+                StringValuePattern.class);
+
+        assertThat(stringValuePattern, instanceOf(MatchesJsonPathPattern.class));
+
+        ContentPattern<?> subMatcher = ((MatchesJsonPathPattern) stringValuePattern).getValuePattern();
+        assertThat(subMatcher, instanceOf(EqualToJsonPattern.class));
+        assertThat(subMatcher.getExpected(), jsonEquals("{}"));
+        assertThat(((EqualToJsonPattern) subMatcher).isIgnoreExtraElements(), is(true));
+        assertThat(((EqualToJsonPattern) subMatcher).isIgnoreArrayOrder(), is(true));
+    }
+
+    @Test
+    public void correctlySerialisesWhenSubMatcherHasExtraParameters() {
+        StringValuePattern matcher = new MatchesJsonPathPattern("$..thing", WireMock.equalToJson("{}", true, true));
+
+        String json = Json.write(matcher);
+
+        assertThat(json, jsonEquals(
+                "{                                       \n" +
+                "    \"matchesJsonPath\": {              \n" +
+                "        \"expression\": \"$..thing\",   \n" +
+                "        \"equalToJson\": \"{}\",        \n" +
+                "        \"ignoreExtraElements\": true,  \n" +
+                "        \"ignoreArrayOrder\": true      \n" +
+                "    }                                   \n" +
+                "}"));
     }
 
     @Test(expected = JsonException.class)
@@ -316,6 +377,37 @@ public class MatchesJsonPathPatternTest {
                 "    }                                   \n" +
                 "}",
             StringValuePattern.class);
+    }
+
+    @Test
+    public void equalsIncludesValuePattern() {
+        StringValuePattern pattern1 = matchingJsonPath("$.LinkageDetails.AccountId", equalTo("1000"));
+        StringValuePattern pattern2 = matchingJsonPath("$.LinkageDetails.AccountId", equalTo("1001"));
+        StringValuePattern pattern3 = matchingJsonPath("$.LinkageDetails.AccountId", equalTo("1000"));
+
+        assertThat(pattern1, not(Matchers.equalTo(pattern2)));
+        assertThat(pattern1.hashCode(), not(Matchers.equalTo(pattern2.hashCode())));
+
+        assertThat(pattern1, Matchers.equalTo(pattern3));
+        assertThat(pattern1.hashCode(), Matchers.equalTo(pattern3.hashCode()));
+    }
+
+    @Test
+    public void treatsAnEmptyArrayExpressionResultAsAbsent() {
+        String json = "{\n" +
+                "  \"Books\": [\n" +
+                "    {\n" +
+                "      \"Author\": {\n" +
+                "        \"Name\": \"1234567\",\n" +
+                "        \"Price\": \"2.2\"\n" +
+                "      }\n" +
+                "    }\n" +
+                "  ]\n" +
+                "}";
+
+        MatchResult result = matchingJsonPath("$..[?(@.Author.ISBN)]", absent()).match(json);
+
+        assertTrue(result.isExactMatch());
     }
 
     private void expectInfoNotification(final String message) {

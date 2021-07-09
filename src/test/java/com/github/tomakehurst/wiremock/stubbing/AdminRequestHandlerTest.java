@@ -17,6 +17,7 @@ package com.github.tomakehurst.wiremock.stubbing;
 
 import com.github.tomakehurst.wiremock.admin.AdminRoutes;
 import com.github.tomakehurst.wiremock.core.Admin;
+import com.github.tomakehurst.wiremock.extension.requestfilter.RequestFilter;
 import com.github.tomakehurst.wiremock.global.GlobalSettings;
 import com.github.tomakehurst.wiremock.http.*;
 import com.github.tomakehurst.wiremock.matching.RequestPattern;
@@ -30,6 +31,8 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import java.util.Collections;
+
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.http.RequestMethod.DELETE;
 import static com.github.tomakehurst.wiremock.http.RequestMethod.POST;
@@ -38,7 +41,7 @@ import static com.github.tomakehurst.wiremock.testsupport.MockRequestBuilder.aRe
 import static com.github.tomakehurst.wiremock.testsupport.WireMatchers.equalToJson;
 import static java.net.HttpURLConnection.HTTP_OK;
 import static org.hamcrest.Matchers.is;
-import static org.junit.Assert.assertThat;
+import static org.hamcrest.MatcherAssert.assertThat;
 
 @RunWith(JMock.class)
 public class AdminRequestHandlerTest {
@@ -55,7 +58,7 @@ public class AdminRequestHandlerTest {
         httpResponder = new MockHttpResponder();
 
 
-		handler = new AdminRequestHandler(AdminRoutes.defaults(), admin, new BasicResponseRenderer(), new NoAuthenticator(), false);
+		handler = new AdminRequestHandler(AdminRoutes.defaults(), admin, new BasicResponseRenderer(), new NoAuthenticator(), false, Collections.<RequestFilter>emptyList());
 	}
 	
     @Test
